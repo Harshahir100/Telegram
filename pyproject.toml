@@ -1,5 +1,6 @@
 [project]
 name = "tamilmv-bot"
+version = "0.1.0"
 
 [tool.vercel]
 entrypoint = "tamilmvbot.angel:app"
