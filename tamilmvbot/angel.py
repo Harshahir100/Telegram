@@ -22,7 +22,11 @@ WEBHOOK_URL = os.getenv('WEBHOOK_URL')
 TAMILMV_URL = os.getenv('TAMILMV_URL', 'https://www.1tamilmv.boo')
 PORT = int(os.getenv('PORT', 3000))
 # ========================================
-bot = telebot.TeleBot(TOKEN, parse_mode='HTML')
+bot = telebot.TeleBot(
+    TOKEN,
+    parse_mode='HTML',
+    threaded=False
+)
 
 # Flask app
 app = Flask(__name__)
@@ -188,13 +192,24 @@ def health_check():
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
+    try:
+        if not request.is_json:
+            return 'Invalid content type', 403
+
+        update = telebot.types.Update.de_json(
+            request.get_data().decode('utf-8')
+        )
+
+        logger.info("Telegram update received")
+
         bot.process_new_updates([update])
-        return ''
-    else:
-        return 'Invalid content type', 403
+
+        logger.info("Telegram update processed")
+        return '', 200
+
+    except Exception:
+        logger.exception("Webhook processing failed")
+        return 'Webhook error', 500
 
 
 if __name__ == "__main__":
