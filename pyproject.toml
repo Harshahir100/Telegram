@@ -1,6 +1,21 @@
 [project]
 name = "tamilmv-bot"
 version = "0.1.0"
+dependencies = [
+    "python-dotenv",
+    "pyTelegramBotAPI",
+    "requests",
+    "aiogram",
+    "beautifulsoup4",
+    "Flask==2.2.2",
+    "Werkzeug==2.2.2",
+    "gunicorn==20.1.0",
+    "python-magic",
+    "pybase64",
+    "regex",
+    "lxml",
+    "bs4"
+]
 
 [tool.vercel]
 entrypoint = "tamilmvbot.angel:app"
