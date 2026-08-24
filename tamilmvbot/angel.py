@@ -122,7 +122,7 @@ def tamilmv():
 
         temps = soup.find_all('div', {'class': 'ipsType_break ipsContained'})
 
-        if len(temps) < 15:
+        if len(temps) < 25:
             logger.warning("Not enough movies found on the page")
             return [], {}
 
