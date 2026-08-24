@@ -126,7 +126,7 @@ def tamilmv():
             logger.warning("Not enough movies found on the page")
             return [], {}
 
-        for i in range(15):
+        for i in range(25):
             title = temps[i].findAll('a')[0].text.strip()
             link = temps[i].find('a')['href']
             movie_list.append(title)
