@@ -1,15 +1,17 @@
 import os
 import time
-import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
-from datetime import datetime, timedelta
+import re
+from urllib.parse import quote_plus
 from dotenv import load_dotenv
 import telebot
 from telebot import types
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, request
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
+from datetime import datetime, timedelta
 
 # Configure logging
 logging.basicConfig(
@@ -25,68 +27,254 @@ TOKEN = os.getenv('TOKEN')
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')
 TAMILMV_URL = os.getenv('TAMILMV_URL', 'https://www.1tamilmv.boo')
 PORT = int(os.getenv('PORT', 3000))
-CACHE_DURATION = int(os.getenv('CACHE_DURATION', 300))  # 5 minutes
-MAX_SEARCH_RESULTS = 10
+CACHE_DURATION = 300  # 5 minutes
 # ============================================
 
 bot = telebot.TeleBot(TOKEN, parse_mode='HTML', threaded=False)
 app = Flask(__name__)
 
-# Global variables with type hints
-movie_list: list = []
-real_dict: dict = {}
-search_results: dict = {}
-cache_timestamp: datetime = None
-
-# Thread pool for parallel scraping
-executor = ThreadPoolExecutor(max_workers=5)
-
-# User rate limiting (simple in-memory)
+# Global variables
+movie_list = []
+real_dict = {}
+search_results_cache = {}
+cache_timestamp = None
 user_last_command = {}
 
-# ============ Helper Functions ============
+# ============ SEARCH FUNCTION ============
 
-def is_rate_limited(user_id: int, cooldown: int = 5) -> bool:
-    """Check if user is rate limited (cooldown in seconds)"""
-    now = time.time()
-    if user_id in user_last_command:
-        if now - user_last_command[user_id] < cooldown:
-            return True
-    user_last_command[user_id] = now
-    return False
-
-def sanitize_input(text: str) -> str:
-    """Sanitize user input"""
-    return text.strip()[:100]  # Limit length
-
-@lru_cache(maxsize=1)
-def get_cached_movies():
-    """Cache movie list for CACHE_DURATION seconds"""
-    global cache_timestamp, movie_list, real_dict
+def search_tamilmv(query):
+    """
+    Search for movies on 1Tamilmv and fetch magnet links
+    """
+    if not query:
+        return []
     
-    if cache_timestamp and (datetime.now() - cache_timestamp).seconds < CACHE_DURATION:
-        logger.info("Returning cached movie data")
-        return movie_list, real_dict
-    
-    logger.info("Fetching fresh movie data")
-    movie_list, real_dict = tamilmv()
-    cache_timestamp = datetime.now()
-    return movie_list, real_dict
+    try:
+        # Clean the query
+        query = query.strip()
+        logger.info(f"Searching for: {query}")
+        
+        # Method 1: Direct search using site's search URL
+        search_url = f"{TAMILMV_URL}/index.php?/search/&q={quote_plus(query)}&type=forums_topic"
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        }
+        
+        response = requests.get(search_url, headers=headers, timeout=20)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'lxml')
+        results = []
+        
+        # Find search results
+        # Method 1: Find in topic list
+        topic_containers = soup.find_all('li', {'class': 'ipsDataItem'})
+        
+        if not topic_containers:
+            # Alternative: Find by article tags
+            topic_containers = soup.find_all('article', {'class': 'ipsDataItem'})
+        
+        for container in topic_containers[:10]:  # Limit to 10 results
+            try:
+                # Get title
+                title_elem = container.find('span', {'class': 'ipsDataItem_title'})
+                if not title_elem:
+                    title_elem = container.find('a', {'class': 'ipsDataItem_title'})
+                
+                if not title_elem:
+                    continue
+                    
+                title = title_elem.text.strip()
+                
+                # Get link
+                link = title_elem.get('href')
+                if not link:
+                    link_elem = container.find('a', href=True)
+                    if link_elem:
+                        link = link_elem.get('href')
+                
+                if not link:
+                    continue
+                    
+                if not link.startswith('http'):
+                    link = f"{TAMILMV_URL}{link}"
+                
+                # Get year if available
+                year_match = re.search(r'\((\d{4})\)', title)
+                year = year_match.group(1) if year_match else ""
+                
+                results.append({
+                    'title': title,
+                    'year': year,
+                    'url': link
+                })
+                
+            except Exception as e:
+                logger.error(f"Error parsing search result: {e}")
+                continue
+        
+        # If no results found, try alternate method - scrape main page
+        if not results:
+            logger.info("No search results, trying main page scrape")
+            results = scrape_main_page_for_search(query)
+        
+        return results
+        
+    except requests.RequestException as e:
+        logger.error(f"Search network error: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        return []
 
-# ============ Command Handlers ============
+def scrape_main_page_for_search(query):
+    """
+    Fallback: Scrape main page and filter by query
+    """
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        response = requests.get(TAMILMV_URL, headers=headers, timeout=15)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'lxml')
+        results = []
+        
+        # Find movie containers
+        containers = soup.find_all('div', {'class': 'ipsType_break ipsContained'})
+        
+        for container in containers[:30]:
+            try:
+                title_elem = container.find('a')
+                if not title_elem:
+                    continue
+                    
+                title = title_elem.text.strip()
+                
+                # Check if query is in title (case insensitive)
+                if query.lower() in title.lower():
+                    link = title_elem.get('href')
+                    if link and not link.startswith('http'):
+                        link = f"{TAMILMV_URL}{link}"
+                    
+                    # Extract year
+                    year_match = re.search(r'\((\d{4})\)', title)
+                    year = year_match.group(1) if year_match else ""
+                    
+                    results.append({
+                        'title': title,
+                        'year': year,
+                        'url': link
+                    })
+                    
+            except Exception as e:
+                continue
+        
+        return results[:10]  # Limit to 10 results
+        
+    except Exception as e:
+        logger.error(f"Main page scrape error: {e}")
+        return []
+
+def get_magnet_links_from_search(link):
+    """
+    Fetch magnet links from a movie detail page
+    """
+    if not link:
+        return []
+    
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        response = requests.get(link, headers=headers, timeout=15)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'lxml')
+        
+        # Get movie title
+        title_elem = soup.find('h1')
+        movie_title = title_elem.text.strip() if title_elem else "Unknown Title"
+        
+        # Find magnet links
+        mag_links = []
+        file_links = []
+        
+        # Method 1: Find all links with magnet:
+        for a in soup.find_all('a', href=True):
+            href = a.get('href', '')
+            if 'magnet:' in href:
+                mag_links.append(href)
+            elif 'torrent' in href.lower() or a.get('data-fileext') == 'torrent':
+                file_links.append(href)
+        
+        # Method 2: Check code blocks for magnet
+        if not mag_links:
+            code_blocks = soup.find_all('pre')
+            for code in code_blocks:
+                text = code.text.strip()
+                if 'magnet:' in text:
+                    # Extract magnet link from text
+                    magnet_match = re.search(r'magnet:\?xt=urn:btih:[a-zA-Z0-9]+[^\s]*', text)
+                    if magnet_match:
+                        mag_links.append(magnet_match.group(0))
+        
+        if not mag_links:
+            return []
+        
+        # Build messages
+        movie_details = []
+        
+        for i, magnet in enumerate(mag_links):
+            torrent_link = file_links[i] if i < len(file_links) else None
+            
+            # Fix torrent URL
+            if torrent_link and not torrent_link.startswith('http'):
+                torrent_link = f"{TAMILMV_URL}{torrent_link}" if torrent_link.startswith('/') else f"{TAMILMV_URL}/{torrent_link}"
+            
+            message = f"""<b>🎬 Movie:</b> <b>{movie_title}</b>
+
+🧲 <b>Magnet Link:</b>
+<code>{magnet}</code>
+"""
+            
+            if torrent_link:
+                message += f"""
+📥 <b>Download Torrent:</b>
+<a href="{torrent_link}">🔗 Click Here to Download</a>
+"""
+            else:
+                message += """
+📥 <b>Torrent File:</b> ❌ Not Available
+"""
+            
+            movie_details.append(message)
+        
+        return movie_details
+        
+    except Exception as e:
+        logger.error(f"Error getting magnet links: {e}")
+        return []
+
+# ============ COMMAND HANDLERS ============
 
 @bot.message_handler(commands=['start'])
 def random_answer(message):
-    if is_rate_limited(message.chat.id):
-        return
-    
-    text_message = """<b>Hello 👋</b>
+    text_message = """<b>👋 Hello! Welcome to Movie Magnet Bot</b>
 
-<blockquote><b>🎬 Get latest Movies from 1Tamilmv</b></blockquote>
+<blockquote><b>🎬 Get Magnet Links for any Movie</b></blockquote>
 
-⚙️ <b>How to use me??</b> 🤔
+⚙️ <b>How to use me:</b>
 
-✯ Please enter /view command and you'll get magnet link as well as link to torrent file 😌
+✯ <b>/search</b> - Search for any movie and get magnet links
+✯ <b>/view</b> - View latest movies from 1Tamilmv
 
 <blockquote><b>🔗 Share and Support 💝</b></blockquote>"""
 
@@ -105,15 +293,10 @@ def random_answer(message):
 
 @bot.message_handler(commands=['view'])
 def view_movies(message):
-    if is_rate_limited(message.chat.id, 10):
-        bot.send_message(message.chat.id, "⏳ Please wait 10 seconds between requests")
-        return
-    
     bot.send_message(message.chat.id, "<b>🧲 Fetching latest movies...</b>")
     
-    # Use cached data
     global movie_list, real_dict
-    movie_list, real_dict = get_cached_movies()
+    movie_list, real_dict = tamilmv()
     
     if not movie_list:
         bot.send_message(message.chat.id, "❌ Failed to fetch movies. Please try again later.")
@@ -131,66 +314,131 @@ def view_movies(message):
 
 @bot.message_handler(commands=['search'])
 def search_movie(message):
-    if is_rate_limited(message.chat.id, 5):
-        bot.send_message(message.chat.id, "⏳ Please wait 5 seconds between searches")
-        return
+    # Get search query
+    query = message.text.replace('/search', '', 1).strip()
     
-    query = sanitize_input(message.text.replace('/search', '', 1).strip())
-
     if not query:
         bot.send_message(
             message.chat.id,
-            "🔎 Please provide a movie name.\n\nExample:\n/search Inception"
+            "🔎 Please enter a movie name to search.\n\nExample:\n/search Inception\n/search Avengers\n/search KGF"
         )
         return
-
-    results = search_authorized_catalog(query)
-
-    if not results:
-        bot.send_message(
-            message.chat.id,
-            f"❌ No results found for: <b>{query}</b>"
-        )
-        return
-
-    keyboard = types.InlineKeyboardMarkup()
-    for index, movie in enumerate(results[:MAX_SEARCH_RESULTS]):
-        title = movie["title"]
-        year = movie.get("year", "")
-        keyboard.add(
-            types.InlineKeyboardButton(
-                text=f"{title} {year}",
-                callback_data=f"movie_{index}"
-            )
-        )
-
-    search_results[message.chat.id] = results[:MAX_SEARCH_RESULTS]
-    bot.send_message(
+    
+    # Send "searching" message
+    searching_msg = bot.send_message(
         message.chat.id,
-        f"🔎 <b>Search results for:</b> {query}",
-        reply_markup=keyboard
+        f"🔍 Searching for: <b>{query}</b>\n\n⏳ Please wait..."
     )
-
-# ============ Callback Handlers ============
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("movie_"))
-def movie_callback(call):
-    results = search_results.get(call.message.chat.id, [])
     
     try:
-        index = int(call.data.split("_")[1])
-        movie = results[index]
+        # Search for movies
+        results = search_tamilmv(query)
         
-        bot.send_message(
-            call.message.chat.id,
-            f"""🎬 <b>{movie['title']}</b>
-
-📅 Year: {movie.get('year', 'N/A')}
-
-🔗 <a href="{movie['url']}">Open Movie</a>"""
+        if not results:
+            bot.edit_message_text(
+                f"❌ No results found for: <b>{query}</b>\n\n💡 Try using a different keyword or check the spelling.",
+                chat_id=message.chat.id,
+                message_id=searching_msg.message_id
+            )
+            return
+        
+        # Create keyboard with results
+        keyboard = types.InlineKeyboardMarkup(row_width=1)
+        for idx, movie in enumerate(results):
+            title = movie.get('title', 'Unknown')
+            year = movie.get('year', '')
+            display_text = f"{title} {year}" if year else title
+            # Truncate if too long
+            if len(display_text) > 60:
+                display_text = display_text[:57] + "..."
+            keyboard.add(
+                types.InlineKeyboardButton(
+                    text=display_text,
+                    callback_data=f"search_{idx}"
+                )
+            )
+        
+        # Store results for callback
+        search_results_cache[message.chat.id] = {
+            'results': results,
+            'timestamp': time.time()
+        }
+        
+        # Update message with results
+        bot.edit_message_text(
+            f"🔎 <b>Search Results for:</b> {query}\n\n📌 Click on a movie to get magnet link:",
+            chat_id=message.chat.id,
+            message_id=searching_msg.message_id,
+            reply_markup=keyboard
         )
-    except (ValueError, IndexError, KeyError):
-        bot.send_message(call.message.chat.id, "❌ Movie result is no longer available.")
+        
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        bot.edit_message_text(
+            f"❌ Error searching for: <b>{query}</b>\n\nPlease try again later.",
+            chat_id=message.chat.id,
+            message_id=searching_msg.message_id
+        )
+
+# ============ CALLBACK HANDLERS ============
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("search_"))
+def handle_search_callback(call):
+    try:
+        # Get index from callback data
+        idx = int(call.data.split('_')[1])
+        
+        # Get cached results
+        cache_data = search_results_cache.get(call.message.chat.id, {})
+        results = cache_data.get('results', [])
+        
+        if idx >= len(results):
+            bot.answer_callback_query(call.id, "❌ This result is no longer available.")
+            return
+        
+        movie = results[idx]
+        movie_title = movie.get('title', 'Unknown')
+        movie_url = movie.get('url', '')
+        
+        if not movie_url:
+            bot.answer_callback_query(call.id, "❌ Movie link not available.")
+            return
+        
+        # Send "fetching" message
+        fetching_msg = bot.send_message(
+            call.message.chat.id,
+            f"📥 Fetching magnet links for: <b>{movie_title}</b>\n\n⏳ Please wait..."
+        )
+        
+        # Get magnet links
+        magnet_details = get_magnet_links_from_search(movie_url)
+        
+        if not magnet_details:
+            bot.edit_message_text(
+                f"❌ No magnet links found for: <b>{movie_title}</b>\n\n💡 Try another movie.",
+                chat_id=call.message.chat.id,
+                message_id=fetching_msg.message_id
+            )
+            return
+        
+        # Send each magnet link
+        for detail in magnet_details:
+            bot.send_message(call.message.chat.id, detail, disable_web_page_preview=True)
+        
+        # Delete the fetching message
+        bot.delete_message(
+            chat_id=call.message.chat.id,
+            message_id=fetching_msg.message_id
+        )
+        
+        # Answer callback
+        bot.answer_callback_query(call.id, f"✅ Magnet links sent for {movie_title}")
+        
+    except ValueError:
+        bot.answer_callback_query(call.id, "❌ Invalid selection.")
+    except Exception as e:
+        logger.error(f"Error in search callback: {e}")
+        bot.answer_callback_query(call.id, "❌ Error fetching movie details.")
 
 @bot.callback_query_handler(func=lambda call: call.data.isdigit())
 def movie_selection_callback(call):
@@ -203,54 +451,39 @@ def movie_selection_callback(call):
             title = movie_list[key]
             if title in real_dict and real_dict[title]:
                 for msg in real_dict[title]:
-                    bot.send_message(call.message.chat.id, text=msg)
+                    bot.send_message(call.message.chat.id, text=msg, disable_web_page_preview=True)
+                bot.answer_callback_query(call.id, f"✅ Details sent for {title}")
             else:
                 bot.send_message(call.message.chat.id, "❌ Movie details not available.")
+                bot.answer_callback_query(call.id, "❌ No details available")
         else:
-            bot.send_message(call.message.chat.id, "❌ Invalid selection.")
+            bot.answer_callback_query(call.id, "❌ Invalid selection.")
     except (ValueError, IndexError):
-        bot.send_message(call.message.chat.id, "❌ Invalid selection.")
+        bot.answer_callback_query(call.id, "❌ Invalid selection.")
 
-# ============ Helper Functions ============
+# ============ HELPER FUNCTIONS ============
 
 def makeKeyboard(movie_list):
     markup = types.InlineKeyboardMarkup(row_width=1)
-    for key, value in enumerate(movie_list[:50]):  # Limit to 50 movies
+    for key, value in enumerate(movie_list[:25]):
+        display_text = value[:50] if len(value) > 50 else value
         markup.add(
             types.InlineKeyboardButton(
-                text=value[:50],  # Truncate long titles
+                text=display_text,
                 callback_data=f"{key}"
             )
         )
     return markup
 
-def get_movie_details_parallel(urls):
-    """Fetch movie details in parallel"""
-    movie_data = {}
-    
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_url = {executor.submit(get_movie_details, url): url for url in urls}
-        for future in as_completed(future_to_url):
-            url = future_to_url[future]
-            try:
-                result = future.result(timeout=30)
-                if result:
-                    movie_data[url] = result
-            except Exception as e:
-                logger.error(f"Error fetching {url}: {e}")
-                movie_data[url] = []
-    
-    return movie_data
-
 def tamilmv():
-    """Scrape movie list with parallel detail fetching"""
+    """Get latest movies from 1Tamilmv"""
     mainUrl = TAMILMV_URL
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
 
     movie_list = []
-    movie_urls = []
+    real_dict = {}
 
     try:
         web = requests.get(mainUrl, headers=headers, timeout=15)
@@ -263,7 +496,6 @@ def tamilmv():
             logger.warning("Not enough movies found on the page")
             return [], {}
 
-        # Collect movie titles and URLs
         for i in range(min(25, len(temps))):
             try:
                 title = temps[i].findAll('a')[0].text.strip()
@@ -271,24 +503,20 @@ def tamilmv():
                 if not link.startswith('http'):
                     link = f"{TAMILMV_URL}{link}"
                 movie_list.append(title)
-                movie_urls.append(link)
-            except (AttributeError, IndexError) as e:
-                logger.error(f"Error parsing movie {i}: {e}")
+                
+                # Fetch movie details
+                movie_details = get_movie_details(link)
+                real_dict[title] = movie_details
+                
+                # Small delay to avoid rate limiting
+                time.sleep(0.1)
+                
+            except Exception as e:
+                logger.error(f"Error processing movie {i}: {e}")
                 continue
-
-        # Fetch details in parallel
-        logger.info(f"Fetching details for {len(movie_urls)} movies in parallel")
-        details_dict = get_movie_details_parallel(movie_urls)
-        
-        real_dict = {}
-        for title, url in zip(movie_list, movie_urls):
-            real_dict[title] = details_dict.get(url, [])
 
         return movie_list, real_dict
         
-    except requests.RequestException as e:
-        logger.error(f"Network error in tamilmv function: {e}")
-        return [], {}
     except Exception as e:
         logger.error(f"Error in tamilmv function: {e}")
         return [], {}
@@ -321,11 +549,10 @@ def get_movie_details(url):
             if torrent_link and not torrent_link.startswith('http'):
                 torrent_link = f'{TAMILMV_URL}{torrent_link}'
 
-            message = f"""<b>📂 Movie Title:</b>
-<blockquote>{movie_title}</blockquote>
+            message = f"""<b>📂 Movie:</b> <b>{movie_title}</b>
 
 🧲 <b>Magnet Link:</b>
-<pre>{mag[p][:500]}</pre>
+<code>{mag[p]}</code>
 """
             if torrent_link:
                 message += f"""
@@ -334,29 +561,21 @@ def get_movie_details(url):
 """
             else:
                 message += """
-📥 <b>Torrent File:</b> Not Available
+📥 <b>Torrent File:</b> ❌ Not Available
 """
             movie_details.append(message)
 
         return movie_details
         
-    except requests.RequestException as e:
-        logger.error(f"Network error retrieving movie details from {url}: {e}")
-        return []
     except Exception as e:
-        logger.error(f"Error retrieving movie details from {url}: {e}")
+        logger.error(f"Error retrieving movie details: {e}")
         return []
 
-def search_authorized_catalog(query):
-    """Replace with actual search implementation"""
-    # This is a placeholder - implement your actual search here
-    return []
-
-# ============ Flask Routes ============
+# ============ FLASK ROUTES ============
 
 @app.route('/')
 def health_check():
-    return "Angel Bot Healthy", 200
+    return "Movie Magnet Bot - Healthy", 200
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -375,7 +594,7 @@ def webhook():
         logger.exception(f"Webhook processing failed: {e}")
         return 'Webhook error', 500
 
-# ============ Main ============
+# ============ MAIN ============
 
 if __name__ == "__main__":
     # Clean webhook URL
