@@ -106,39 +106,101 @@ def makeKeyboard(movie_list):
     return markup 
  
  
-def tamilmv(): 
-    mainUrl = TAMILMV_URL 
-    headers = { 
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36' 
-    } 
- 
-    movie_list = [] 
-    real_dict = {} 
- 
-    try: 
-        web = requests.get(mainUrl, headers=headers) 
-        web.raise_for_status() 
-        soup = BeautifulSoup(web.text, 'lxml') 
- 
-        temps = soup.find_all('div', {'class': 'ipsType_break ipsContained'}) 
- 
-        if len(temps) < 29: 
-            logger.warning("Not enough movies found on the page") 
-            return [], {} 
- 
-        for i in range(29): 
-            title = temps[i].findAll('a')[0].text.strip() 
-            link = temps[i].find('a')['href'] 
-            movie_list.append(title) 
- 
-            movie_details = get_movie_details(link) 
-            real_dict[title] = movie_details 
- 
-        return movie_list, real_dict 
-    except Exception as e: 
-        logger.error(f"Error in tamilmv function: {e}") 
-        return [], {} 
- 
+def tamilmv():
+    mainUrl = TAMILMV_URL
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                      'AppleWebKit/537.36 (KHTML, like Gecko) '
+                      'Chrome/91.0.4472.124 Safari/537.36'
+    }
+
+    movie_list = []
+    real_dict = {}
+
+    try:
+        # Maximum 5 pages
+        for page in range(1, 6):
+
+            # Page 1 = main URL
+            if page == 1:
+                url = mainUrl
+            else:
+                url = f"{mainUrl}/page/{page}/"
+
+            logger.info(f"Fetching page {page}: {url}")
+
+            web = requests.get(
+                url,
+                headers=headers,
+                timeout=30
+            )
+            web.raise_for_status()
+
+            soup = BeautifulSoup(web.text, 'lxml')
+
+            temps = soup.find_all(
+                'div',
+                {'class': 'ipsType_break ipsContained'}
+            )
+
+            logger.info(
+                f"Page {page}: {len(temps)} movies found"
+            )
+
+            if not temps:
+                logger.warning(
+                    f"No movies found on page {page}"
+                )
+                break
+
+            for item in temps:
+
+                # Movie title
+                a_tag = item.find('a', href=True)
+
+                if not a_tag:
+                    continue
+
+                title = a_tag.text.strip()
+                link = a_tag['href']
+
+                # Avoid duplicate movies
+                if title in real_dict:
+                    continue
+
+                movie_list.append(title)
+
+                # Fetch magnet + torrent
+                movie_details = get_movie_details(link)
+
+                real_dict[title] = movie_details
+
+                logger.info(
+                    f"Movie {len(movie_list)}: {title}"
+                )
+
+                # Stop after 100
+                if len(movie_list) >= 100:
+                    break
+
+            if len(movie_list) >= 100:
+                break
+
+            # Small delay between pages
+            time.sleep(1)
+
+        logger.info(
+            f"Total movies fetched: {len(movie_list)}"
+        )
+
+        return movie_list, real_dict
+
+    except Exception as e:
+        logger.error(
+            f"Error in tamilmv function: {e}"
+        )
+        return [], {}
  
 def get_movie_details(url): 
     try: 
