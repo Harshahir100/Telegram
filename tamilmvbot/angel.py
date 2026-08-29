@@ -71,10 +71,7 @@ def random_answer(message):
 
 @bot.message_handler(commands=['view'])
 def start(message):
-    bot.send_message(
-    message.chat.id,
-    "<b>🧲 Fetching movies... Please wait ⏳</b>"
-)
+    bot.send_message(message.chat.id, "<b>🧲 Please wait for 10 ⏰ seconds</b>")
     global movie_list, real_dict
     movie_list, real_dict = tamilmv()
 
@@ -83,8 +80,8 @@ def start(message):
 
     bot.send_photo(
         chat_id=message.chat.id,
-        photo='https://graph.org/file/4e8a1172e8ba4b7a0bdfa.jpg',
-        caption=combined_caption,
+        photo='https://graph.org/file/4e8a1172e8ba4b7a0bdfa.jpg', 
+        caption=combined_caption, 
         reply_markup=keyboard 
     ) 
  
@@ -102,140 +99,46 @@ def callback_query(call):
 def makeKeyboard(movie_list): 
     markup = types.InlineKeyboardMarkup() 
     for key, value in enumerate(movie_list): 
-        markup.add(
-            types.InlineKeyboardButton(
-                text=value,
+        markup.add( 
+            types.InlineKeyboardButton( 
+                text=value, 
                 callback_data=f"{key}")) 
     return markup 
  
  
-def tamilmv():
-    mainUrl = TAMILMV_URL.rstrip("/")
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        )
-    }
-
-    movie_list = []
-    real_dict = {}
-
-    try:
-        for page in range(1, 6):
-
-            # Page 1
-            if page == 1:
-                url = mainUrl
-
-            # Page 2, 3, 4...
-            else:
-                url = f"{mainUrl}/page/{page}/"
-
-            logger.info(f"Fetching page: {url}")
-
-            web = requests.get(
-                url,
-                headers=headers,
-                timeout=30
-            )
-
-            logger.info(
-                f"Status: {web.status_code} | URL: {web.url}"
-            )
-
-            web.raise_for_status()
-
-            soup = BeautifulSoup(
-                web.text,
-                "lxml"
-            )
-
-            # Same selector as your ORIGINAL working code
-            temps = soup.find_all(
-                "div",
-                {"class": "ipsType_break ipsContained"}
-            )
-
-            logger.info(
-                f"Page {page}: found {len(temps)} items"
-            )
-
-            if not temps:
-                logger.warning(
-                    f"No movies found on page {page}"
-                )
-                continue
-
-            for item in temps:
-
-                try:
-                    a = item.find("a", href=True)
-
-                    if not a:
-                        continue
-
-                    title = a.get_text(strip=True)
-                    link = a.get("href")
-
-                    if not title or not link:
-                        continue
-
-                    # Make URL absolute
-                    if link.startswith("/"):
-                        link = mainUrl + link
-
-                    elif not link.startswith("http"):
-                        link = (
-                            mainUrl + 
-                            "/" + 
-                            link.lstrip("/")
-                        )
-
-                    # Duplicate check
-                    if title in real_dict:
-                        continue
-
-                    movie_list.append(title)
-
-                    logger.info(
-                        f"[{len(movie_list)}] {title}"
-                    )
-
-                    # Fetch magnet/torrent
-                    real_dict[title] = get_movie_details(
-                        link
-                    )
-
-                    # Stop at 100
-                    if len(movie_list) >= 100:
-                        return movie_list, real_dict
-
-                    time.sleep(0.3)
-
-                except Exception as e:
-                    logger.error(
-                        f"Movie error: {e}"
-                    )
-
-            time.sleep(1)
-
-        logger.info(
-            f"TOTAL MOVIES: {len(movie_list)}"
-        )
-
-        return movie_list, real_dict
-
-    except Exception as e:
-
-        logger.exception(
-            f"tamilmv ERROR: {e}"
-        )
-
-        return [], {}
-
+def tamilmv(): 
+    mainUrl = TAMILMV_URL 
+    headers = { 
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36' 
+    } 
+ 
+    movie_list = [] 
+    real_dict = {} 
+ 
+    try: 
+        web = requests.get(mainUrl, headers=headers) 
+        web.raise_for_status() 
+        soup = BeautifulSoup(web.text, 'lxml') 
+ 
+        temps = soup.find_all('div', {'class': 'ipsType_break ipsContained'}) 
+ 
+        if len(temps) < 25: 
+            logger.warning("Not enough movies found on the page") 
+            return [], {} 
+ 
+        for i in range(25): 
+            title = temps[i].findAll('a')[0].text.strip() 
+            link = temps[i].find('a')['href'] 
+            movie_list.append(title) 
+ 
+            movie_details = get_movie_details(link) 
+            real_dict[title] = movie_details 
+ 
+        return movie_list, real_dict 
+    except Exception as e: 
+        logger.error(f"Error in tamilmv function: {e}") 
+        return [], {} 
+ 
  
 def get_movie_details(url): 
     try: 
@@ -243,13 +146,13 @@ def get_movie_details(url):
         html.raise_for_status() 
         soup = BeautifulSoup(html.text, 'lxml') 
  
-        mag = [a['href'] for a in soup.find_all(
+        mag = [a['href'] for a in soup.find_all( 
             'a', href=True) if 'magnet:' in a['href']] 
-        filelink = [a['href'] for a in soup.find_all(
+        filelink = [a['href'] for a in soup.find_all( 
             'a', {"data-fileext": "torrent", 'href': True})] 
  
         movie_details = [] 
-        movie_title = soup.find('h1').text.strip(
+        movie_title = soup.find('h1').text.strip( 
         ) if soup.find('h1') else "Unknown Title" 
  
         for p in range(len(mag)): 
@@ -293,7 +196,7 @@ def webhook():
         if not request.is_json: 
             return 'Invalid content type', 403 
  
-        update = telebot.types.Update.de_json(
+        update = telebot.types.Update.de_json( 
             request.get_data().decode('utf-8') 
         ) 
  
