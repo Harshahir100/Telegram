@@ -122,11 +122,11 @@ def tamilmv():
  
         temps = soup.find_all('div', {'class': 'ipsType_break ipsContained'}) 
  
-        if len(temps) < 25: 
+        if len(temps) < 100: 
             logger.warning("Not enough movies found on the page") 
             return [], {} 
  
-        for i in range(25): 
+        for i in range(100): 
             title = temps[i].findAll('a')[0].text.strip() 
             link = temps[i].find('a')['href'] 
             movie_list.append(title) 
