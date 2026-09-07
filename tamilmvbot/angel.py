@@ -26,7 +26,7 @@ load_dotenv()
 
 TOKEN = os.getenv("TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-TAMILMV_URL = os.getenv("TAMILMV_URL", "https://www.1tamilmv.boo")
+TAMILMV_URL = os.getenv("TAMILMV_URL", "https://www.1tamilmv.fi")
 PORT = int(os.getenv("PORT", 3000))
 
 if not TOKEN:
