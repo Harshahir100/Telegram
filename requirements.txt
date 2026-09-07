@@ -13,3 +13,12 @@ regex
 lxml
 bs4
 # ======== SudoR2spr ========🎉 v2.0 ==
+
+
+
+Flask==2.3.2
+pyTelegramBotAPI==4.13.0
+requests==2.31.0
+beautifulsoup4==4.12.2
+lxml==4.9.3
+python-dotenv==1.0.0
