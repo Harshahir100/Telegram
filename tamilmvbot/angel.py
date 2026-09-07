@@ -7,7 +7,7 @@ from flask import Flask, request
 from telebot import types
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from cachetools import TTLCache
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================
 # LOGGING
@@ -36,12 +36,6 @@ if not WEBHOOK_URL:
     raise RuntimeError("WEBHOOK_URL is missing!")
 
 # ============================================================
-# CACHE
-# ============================================================
-
-cache = TTLCache(maxsize=100, ttl=600)  # 10 minutes
-
-# ============================================================
 # TELEGRAM BOT
 # ============================================================
 
@@ -60,6 +54,7 @@ real_dict = {}
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate",
 }
 
 # ============================================================
@@ -97,27 +92,22 @@ def random_answer(message):
         bot.send_message(message.chat.id, text_message, reply_markup=keyboard)
 
 # ============================================================
-# /view
+# /view - FAST VERSION
 # ============================================================
 
 @bot.message_handler(commands=["view"])
 def start(message):
     chat_id = message.chat.id
+    
+    # Send initial message
     wait_message = bot.send_message(chat_id, "<b>⏳ Fetching movies... Please wait</b>")
 
     global movie_list, real_dict
 
     try:
-        cache_key = "movies_data"
-        if cache_key in cache:
-            logger.info("Using cached movies")
-            movie_list, real_dict = cache[cache_key]
-        else:
-            logger.info("Fetching fresh movies")
-            movie_list, real_dict = get_movies()
-            if movie_list:
-                cache[cache_key] = (movie_list, real_dict)
-            
+        # Get movies with timeout protection
+        movie_list, real_dict = get_movies_fast()
+        
     except Exception as e:
         logger.exception("Movie fetch failed: %s", e)
         bot.edit_message_text(
@@ -184,7 +174,7 @@ def callback_query(call):
         bot.send_message(call.message.chat.id, "<b>❌ Details are not available.</b>")
         return
 
-    for text in details:
+    for text in details[:3]:  # Limit to 3 messages
         try:
             bot.send_message(call.message.chat.id, text)
         except Exception as e:
@@ -197,125 +187,132 @@ def callback_query(call):
 def make_keyboard(movies):
     markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = []
-    for index, title in enumerate(movies[:30]):  # Limit to 30
+    for index, title in enumerate(movies[:15]):  # Only 15 movies for speed
         buttons.append(types.InlineKeyboardButton(
-            text=title[:30],
+            text=title[:25],
             callback_data=str(index)
         ))
-    markup.add(*buttons)
+    if buttons:
+        markup.add(*buttons)
     return markup
 
 # ============================================================
-# MOVIE SCRAPER
+# FAST MOVIE SCRAPER - Optimized for Vercel
 # ============================================================
 
-def get_movies():
-    """Scrape movies from 1TamilMV"""
+def get_movies_fast():
+    """Fast movie scraper - optimized for Vercel 10s timeout"""
     
     if not TAMILMV_URL:
-        logger.warning("TAMILMV_URL is not configured.")
         return [], {}
     
     movie_list = []
     real_dict = {}
     
     try:
-        response = requests.get(TAMILMV_URL, headers=HEADERS, timeout=15)
+        # Quick main page fetch
+        response = requests.get(TAMILMV_URL, headers=HEADERS, timeout=8)
         response.raise_for_status()
         
         soup = BeautifulSoup(response.text, 'html.parser')
         temps = soup.find_all('div', {'class': 'ipsType_break ipsContained'})
         
-        if len(temps) < 20:
-            logger.warning("Not enough movies found on the page")
+        if len(temps) < 10:
             return [], {}
         
-        for i in range(min(25, len(temps))):
+        # Get only first 10 movies for speed
+        movie_urls = []
+        for i in range(min(10, len(temps))):
             try:
                 title = temps[i].findAll('a')[0].text.strip()
                 link = temps[i].find('a')['href']
+                movie_urls.append((title, link))
                 movie_list.append(title)
-                
-                # Fetch details for each movie
-                movie_details = get_movie_details(link)
-                real_dict[title] = movie_details
-                
             except Exception as e:
                 logger.error(f"Error processing movie {i}: {e}")
                 continue
+        
+        # Fetch details in parallel with timeout
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_movie = {
+                executor.submit(get_movie_details_fast, title, link): (title, link)
+                for title, link in movie_urls
+            }
             
+            for future in as_completed(future_to_movie, timeout=8):
+                title, link = future_to_movie[future]
+                try:
+                    details = future.result(timeout=5)
+                    if details:
+                        real_dict[title] = details
+                except Exception as e:
+                    logger.error(f"Error fetching details for {title}: {e}")
+                    real_dict[title] = []
+        
         return movie_list, real_dict
         
+    except requests.Timeout:
+        logger.error("Request timeout")
+        return [], {}
     except Exception as e:
-        logger.error(f"Error in get_movies: {e}")
+        logger.error(f"Error in get_movies_fast: {e}")
         return [], {}
 
-def get_movie_details(url):
-    """Get movie details from URL"""
+def get_movie_details_fast(title, url):
+    """Fast movie details fetch"""
     try:
         if not url.startswith('http'):
             url = f'{TAMILMV_URL}{url}'
             
-        response = requests.get(url, headers=HEADERS, timeout=10)
+        response = requests.get(url, headers=HEADERS, timeout=5)
         response.raise_for_status()
         
         soup = BeautifulSoup(response.text, 'html.parser')
         
+        # Get only first magnet link
         mag = [a['href'] for a in soup.find_all('a', href=True) if 'magnet:' in a['href']]
         filelink = [a['href'] for a in soup.find_all('a', {"data-fileext": "torrent", 'href': True})]
         
-        movie_details = []
         movie_title = soup.find('h1')
-        movie_title = movie_title.text.strip() if movie_title else "Unknown Title"
+        movie_title = movie_title.text.strip() if movie_title else title
+        
+        movie_details = []
         
         if mag:
-            for p in range(len(mag)):
-                torrent_link = filelink[p] if p < len(filelink) else None
+            # Only first magnet link
+            torrent_link = filelink[0] if filelink else None
+            if torrent_link and not torrent_link.startswith('http'):
+                torrent_link = f'{TAMILMV_URL}{torrent_link}'
+            
+            message = f"""
+<b>📂 {movie_title}</b>
+
+🧲 <b>Magnet:</b>
+<pre>{mag[0][:150]}...</pre>"""
+            
+            if torrent_link:
+                message += f"""
+📥 <a href="{torrent_link}">⬇️ Download Torrent</a>"""
+            
+            movie_details.append(message)
+        else:
+            # Try torrent only
+            download_links = soup.find_all('a', {'data-fileext': 'torrent'})
+            if download_links:
+                torrent_link = download_links[0].get('href')
                 if torrent_link and not torrent_link.startswith('http'):
                     torrent_link = f'{TAMILMV_URL}{torrent_link}'
                 
                 message = f"""
-<b>📂 Movie Title:</b>
-<blockquote>{movie_title}</blockquote>
+<b>📂 {movie_title}</b>
 
-🧲 <b>Magnet Link:</b>
-<pre>{mag[p]}</pre>
-"""
-                if torrent_link:
-                    message += f"""
-📥 <b>Download Torrent:</b>
-<a href="{torrent_link}">🔗 Click Here</a>
-"""
-                else:
-                    message += """
-📥 <b>Torrent File:</b> Not Available
-"""
-                
+📥 <a href="{torrent_link}">⬇️ Download Torrent</a>"""
                 movie_details.append(message)
-        else:
-            # Try torrent links
-            download_links = soup.find_all('a', {'data-fileext': 'torrent'})
-            if download_links:
-                for link in download_links[:3]:
-                    torrent_link = link.get('href')
-                    if torrent_link and not torrent_link.startswith('http'):
-                        torrent_link = f'{TAMILMV_URL}{torrent_link}'
-                    
-                    message = f"""
-<b>📂 Movie Title:</b>
-<blockquote>{movie_title}</blockquote>
-
-📥 <b>Download Torrent:</b>
-<a href="{torrent_link}">🔗 Click Here</a>
-
-⚠️ <b>Note:</b> Magnet link not available
-"""
-                    movie_details.append(message)
-            
+        
         return movie_details
         
     except Exception as e:
-        logger.error(f"Error retrieving movie details from {url}: {e}")
+        logger.error(f"Error for {title}: {e}")
         return []
 
 # ============================================================
@@ -341,11 +338,10 @@ def webhook():
         return "Webhook error", 500
 
 # ============================================================
-# SET WEBHOOK (Runs on Vercel deployment)
+# SET WEBHOOK
 # ============================================================
 
 def set_webhook():
-    """Set webhook on startup"""
     try:
         webhook_url = f"{WEBHOOK_URL}/webhook"
         bot.remove_webhook()
@@ -358,13 +354,12 @@ def set_webhook():
         return False
 
 # ============================================================
-# MAIN - Vercel uses this
+# MAIN
 # ============================================================
 
-# Set webhook when app starts
+# Set webhook
 set_webhook()
 
 if __name__ == "__main__":
-    # For local testing only
     port = int(os.getenv("PORT", 3000))
     app.run(host="0.0.0.0", port=port)
