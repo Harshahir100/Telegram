@@ -1,12 +1,20 @@
 import os
 import time
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
 import telebot
-from flask import Flask, request
-from telebot import types
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from flask import Flask
+from telebot import types
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from bs4 import BeautifulSoup
+import json
+from functools import lru_cache
+from cachetools import TTLCache
 
 # ============================================================
 # LOGGING
@@ -16,7 +24,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-
 logger = logging.getLogger(__name__)
 
 # ============================================================
@@ -26,35 +33,68 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 TOKEN = os.getenv("TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+PORT = int(os.getenv("PORT", "3000"))
 TAMILMV_URL = os.getenv("TAMILMV_URL", "https://www.1tamilmv.boo")
 
 if not TOKEN:
-    raise RuntimeError("TOKEN is missing!")
+    raise RuntimeError("TOKEN is missing. Add TOKEN=... to your .env file.")
 
-if not WEBHOOK_URL:
-    raise RuntimeError("WEBHOOK_URL is missing!")
+# ============================================================
+# CACHE - 10 minutes cache
+# ============================================================
+
+cache = TTLCache(maxsize=100, ttl=600)  # 10 minutes
 
 # ============================================================
 # TELEGRAM BOT
 # ============================================================
 
-bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
+bot = telebot.TeleBot(TOKEN, parse_mode="HTML", threaded=True)
 
 # ============================================================
-# FLASK APP
+# FLASK
 # ============================================================
 
 app = Flask(__name__)
 
-# Global variables
-movie_list = []
-real_dict = {}
+@app.route("/")
+def health_check():
+    return "Angel Bot Healthy", 200
+
+# ============================================================
+# OPTIMIZED HTTP SESSION
+# ============================================================
+
+session = requests.Session()
+retry = Retry(
+    total=3,
+    connect=3,
+    read=3,
+    backoff_factor=0.5,  # Reduced backoff
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"]
+)
+adapter = HTTPAdapter(
+    max_retries=retry,
+    pool_connections=50,  # More connections
+    pool_maxsize=50
+)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
 }
+
+# ============================================================
+# GLOBAL MOVIE DATA
+# ============================================================
+
+movie_list = []
+real_dict = {}
 
 # ============================================================
 # /start
@@ -91,18 +131,27 @@ def random_answer(message):
         bot.send_message(message.chat.id, text_message, reply_markup=keyboard)
 
 # ============================================================
-# /view
+# /view - FAST VERSION
 # ============================================================
 
 @bot.message_handler(commands=["view"])
 def start(message):
     chat_id = message.chat.id
-    wait_message = bot.send_message(chat_id, "<b>🧲 Please wait for 10 ⏰ seconds</b>")
+    wait_message = bot.send_message(chat_id, "<b>⏳ Fetching movies... Please wait</b>")
 
     global movie_list, real_dict
 
     try:
-        movie_list, real_dict = get_movies()
+        # Check cache first
+        cache_key = "movies_data"
+        if cache_key in cache:
+            logger.info("Using cached movies")
+            movie_list, real_dict = cache[cache_key]
+        else:
+            logger.info("Fetching fresh movies")
+            movie_list, real_dict = get_movies_fast()
+            cache[cache_key] = (movie_list, real_dict)
+            
     except Exception as e:
         logger.exception("Movie fetch failed: %s", e)
         bot.edit_message_text(
@@ -126,7 +175,8 @@ def start(message):
         pass
 
     combined_caption = (
-        "<b><blockquote>🔗 Select a Movie from the list 🎬</blockquote></b>\n\n🔘 Please select a movie:"
+        "<b><blockquote>🔗 Select a Movie from the list 🎬</blockquote></b>\n\n"
+        f"📊 Total: {len(movie_list)} movies"
     )
 
     keyboard = make_keyboard(movie_list)
@@ -168,28 +218,39 @@ def callback_query(call):
         bot.send_message(call.message.chat.id, "<b>❌ Details are not available.</b>")
         return
 
-    for text in details:
-        try:
-            bot.send_message(call.message.chat.id, text)
-        except Exception as e:
-            logger.exception("Failed to send movie details: %s", e)
+    # Send as one message instead of multiple
+    full_text = "\n\n".join(details)
+    if len(full_text) > 4096:
+        # Split if too long
+        for text in details:
+            try:
+                bot.send_message(call.message.chat.id, text)
+            except Exception as e:
+                logger.exception("Failed to send movie details: %s", e)
+    else:
+        bot.send_message(call.message.chat.id, full_text)
 
 # ============================================================
 # KEYBOARD
 # ============================================================
 
 def make_keyboard(movies):
-    markup = types.InlineKeyboardMarkup()
+    markup = types.InlineKeyboardMarkup(row_width=2)  # 2 columns
+    buttons = []
     for index, title in enumerate(movies):
-        markup.add(types.InlineKeyboardButton(text=title[:64], callback_data=str(index)))
+        buttons.append(types.InlineKeyboardButton(
+            text=title[:30],  # Shorter text
+            callback_data=str(index)
+        ))
+    markup.add(*buttons)
     return markup
 
 # ============================================================
-# MOVIE SCRAPER
+# FAST MOVIE SCRAPER - Using ThreadPoolExecutor
 # ============================================================
 
-def get_movies():
-    """Scrape movies from 1TamilMV"""
+def get_movies_fast():
+    """Scrape movies from 1TamilMV - FAST version"""
     
     if not TAMILMV_URL:
         logger.warning("TAMILMV_URL is not configured.")
@@ -199,116 +260,143 @@ def get_movies():
     real_dict = {}
     
     try:
-        response = requests.get(TAMILMV_URL, headers=HEADERS, timeout=30)
+        # Step 1: Get main page quickly
+        response = session.get(TAMILMV_URL, headers=HEADERS, timeout=15)
         response.raise_for_status()
         
-        soup = BeautifulSoup(response.text, 'lxml')
+        soup = BeautifulSoup(response.text, 'html.parser')  # Faster than lxml for parsing
+        
         temps = soup.find_all('div', {'class': 'ipsType_break ipsContained'})
         
-        if len(temps) < 25:
+        if len(temps) < 20:
             logger.warning("Not enough movies found on the page")
             return [], {}
         
-        for i in range(25):
+        # Collect all movie URLs
+        movie_urls = []
+        for i in range(min(25, len(temps))):
             try:
                 title = temps[i].findAll('a')[0].text.strip()
                 link = temps[i].find('a')['href']
+                movie_urls.append((title, link))
                 movie_list.append(title)
-                
-                movie_details = get_movie_details(link)
-                real_dict[title] = movie_details
-                
             except Exception as e:
                 logger.error(f"Error processing movie {i}: {e}")
                 continue
+        
+        # Step 2: Fetch movie details in parallel
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_movie = {
+                executor.submit(get_movie_details_fast, title, link): (title, link)
+                for title, link in movie_urls
+            }
             
+            for future in as_completed(future_to_movie):
+                title, link = future_to_movie[future]
+                try:
+                    details = future.result(timeout=10)
+                    real_dict[title] = details
+                except Exception as e:
+                    logger.error(f"Error fetching details for {title}: {e}")
+                    real_dict[title] = []
+        
         return movie_list, real_dict
         
     except Exception as e:
-        logger.error(f"Error in get_movies: {e}")
+        logger.error(f"Error in get_movies_fast: {e}")
         return [], {}
 
-def get_movie_details(url):
-    """Get movie details from URL"""
+def get_movie_details_fast(title, url):
+    """Get movie details from URL - FAST version"""
     try:
         if not url.startswith('http'):
             url = f'{TAMILMV_URL}{url}'
             
-        response = requests.get(url, headers=HEADERS, timeout=15)
+        response = session.get(url, headers=HEADERS, timeout=8)
         response.raise_for_status()
         
-        soup = BeautifulSoup(response.text, 'lxml')
+        soup = BeautifulSoup(response.text, 'html.parser')  # Faster than lxml
         
+        # Get magnet links
         mag = [a['href'] for a in soup.find_all('a', href=True) if 'magnet:' in a['href']]
         filelink = [a['href'] for a in soup.find_all('a', {"data-fileext": "torrent", 'href': True})]
         
-        movie_details = []
-        movie_title = soup.find('h1').text.strip() if soup.find('h1') else "Unknown Title"
+        movie_title = soup.find('h1')
+        movie_title = movie_title.text.strip() if movie_title else title
         
-        for p in range(len(mag)):
-            torrent_link = filelink[p] if p < len(filelink) else None
-            if torrent_link and not torrent_link.startswith('http'):
-                torrent_link = f'{TAMILMV_URL}{torrent_link}'
-            
-            message = f"""
-<b>📂 Movie Title:</b>
-<blockquote>{movie_title}</blockquote>
+        movie_details = []
+        
+        # Build messages efficiently
+        if mag:
+            for p in range(len(mag)):
+                torrent_link = filelink[p] if p < len(filelink) else None
+                if torrent_link and not torrent_link.startswith('http'):
+                    torrent_link = f'{TAMILMV_URL}{torrent_link}'
+                
+                message = f"""<b>📂 {movie_title}</b>
 
-🧲 <b>Magnet Link:</b>
-<pre>{mag[p]}</pre>
-"""
-            if torrent_link:
-                message += f"""
-📥 <b>Download Torrent:</b>
-<a href="{torrent_link}">🔗 Click Here</a>
-"""
-            else:
-                message += """
-📥 <b>Torrent File:</b> Not Available
-"""
-            
-            movie_details.append(message)
-            
+🧲 <b>Magnet:</b>
+<pre>{mag[p][:200]}...</pre>"""
+                
+                if torrent_link:
+                    message += f"""
+📥 <a href="{torrent_link}">⬇️ Download Torrent</a>"""
+                
+                movie_details.append(message)
+        else:
+            # Try torrent only
+            download_links = soup.find_all('a', {'data-fileext': 'torrent'})
+            if download_links:
+                for link in download_links[:2]:  # Limit to 2
+                    torrent_link = link.get('href')
+                    if torrent_link and not torrent_link.startswith('http'):
+                        torrent_link = f'{TAMILMV_URL}{torrent_link}'
+                    
+                    message = f"""<b>📂 {movie_title}</b>
+📥 <a href="{torrent_link}">⬇️ Download Torrent</a>
+⚠️ No magnet link available"""
+                    movie_details.append(message)
+        
         return movie_details
         
     except Exception as e:
-        logger.error(f"Error retrieving movie details from {url}: {e}")
+        logger.error(f"Error retrieving movie details for {title}: {e}")
         return []
 
 # ============================================================
-# WEBHOOK
+# FLASK SERVER
 # ============================================================
 
-@app.route("/", methods=["GET"])
-def index():
-    return "Angel Bot is running!", 200
+def run_flask():
+    logger.info("Starting Flask health server on port %s", PORT)
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
+# ============================================================
+# TELEGRAM POLLING
+# ============================================================
+
+def run_bot():
+    logger.info("Removing previous Telegram webhook...")
     try:
-        if request.headers.get("content-type") != "application/json":
-            return "Invalid content type", 403
-
-        json_str = request.get_data().decode("utf-8")
-        update = telebot.types.Update.de_json(json_str)
-        bot.process_new_updates([update])
-        return "OK", 200
+        bot.remove_webhook()
+        time.sleep(1)
     except Exception as e:
-        logger.exception(f"Webhook error: {e}")
-        return "Webhook error", 500
+        logger.warning("Could not remove webhook: %s", e)
+
+    logger.info("Starting Telegram bot polling...")
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+        except Exception as e:
+            logger.exception("Telegram polling error: %s", e)
+            logger.info("Restarting polling in 5 seconds...")
+            time.sleep(5)
 
 # ============================================================
-# MAIN - For local testing only
+# MAIN
 # ============================================================
 
 if __name__ == "__main__":
-    # Remove webhook and set new one
-    bot.remove_webhook()
-    time.sleep(1)
-    webhook_url = f"{WEBHOOK_URL}/webhook"
-    bot.set_webhook(url=webhook_url)
-    logger.info(f"Webhook set to: {webhook_url}")
-    
-    # Run Flask
-    port = int(os.getenv("PORT", 3000))
-    app.run(host="0.0.0.0", port=port)
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    run_bot()
